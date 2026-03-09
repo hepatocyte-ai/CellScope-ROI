@@ -189,7 +189,7 @@ def _canvas_roi(
         fill_color       = f"rgba(255, 100, 0, {fill_alpha})",
         stroke_color     = "#FF4500",
         stroke_width     = stroke_width,
-        background_image = Image.fromarray(to_rgb_image(image_np)).resize((dw, dh)),
+        background_image = Image.fromarray(image_np),
         update_streamlit = True,
         width            = dw,
         height           = dh,
