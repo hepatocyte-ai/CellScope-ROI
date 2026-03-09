@@ -1,6 +1,8 @@
 """
 🔬 Cell Counter — точка входа Streamlit
 """
+from utils.canvas_patch import apply as _apply_canvas_patch
+_apply_canvas_patch()
 
 import hashlib
 import io
