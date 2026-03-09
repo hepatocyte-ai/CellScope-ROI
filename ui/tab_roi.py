@@ -253,45 +253,194 @@ def _canvas_roi(
 
 
 # ── Слайдеры-фолбэк ───────────────────────────────────────────────────────────
+def _extract_rotated_roi(
+    image_np: np.ndarray,
+    mask_np: np.ndarray,
+    cx: int, cy: int,
+    rw: int, rh: int,
+    angle: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Вырезает ROI с учётом угла наклона.
+    При angle=0 — быстрый путь без трансформации.
+    При angle≠0 — разворачивает снимок вокруг (cx,cy) на -angle,
+    после чего прямоугольник становится оси-выровненным, и делает кроп.
+    """
+    H, W = image_np.shape[:2]
+    x0 = max(0, cx - rw // 2);  x1 = min(W, cx + rw // 2)
+    y0 = max(0, cy - rh // 2);  y1 = min(H, cy + rh // 2)
+
+    if angle == 0:
+        return image_np[y0:y1, x0:x1].copy(), mask_np[y0:y1, x0:x1].copy()
+
+    M = cv2.getRotationMatrix2D((float(cx), float(cy)), float(angle), 1.0)
+
+    rot_img = cv2.warpAffine(
+        image_np, M, (W, H),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+    )
+    rot_mask = cv2.warpAffine(
+        mask_np.astype(np.float32), M, (W, H),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    ).astype(mask_np.dtype)
+
+    return rot_img[y0:y1, x0:x1].copy(), rot_mask[y0:y1, x0:x1].copy()
+
+
+def _draw_rotated_rect(
+    img: np.ndarray,
+    cx: int, cy: int,
+    rw: int, rh: int,
+    angle: float,
+    color: tuple = (255, 69, 0),
+    fill_alpha: float = 0.15,
+) -> None:
+    """Рисует полупрозрачный наклонный прямоугольник + крест в центре (in-place)."""
+    rect    = ((float(cx), float(cy)), (float(rw), float(rh)), float(-angle))
+    box     = cv2.boxPoints(rect).astype(np.int32)
+    overlay = img.copy()
+    cv2.fillPoly(overlay, [box], color)
+    cv2.addWeighted(overlay, fill_alpha, img, 1.0 - fill_alpha, 0, img)
+    cv2.polylines(img, [box], isClosed=True, color=color, thickness=2)
+    cv2.drawMarker(img, (cx, cy), color, cv2.MARKER_CROSS, markerSize=18, thickness=2)
+
 
 def _sliders_roi(
     image_np, mask_np, class_names, config, palette, vis_params,
     H, W, pair_hash,
 ):
-    st.warning(
-        "⚠️ `streamlit-drawable-canvas` не установлен — "
-        "используется ручной выбор координат.\n\n"
-        "Для рисования ROI мышью: `pip install streamlit-drawable-canvas`"
+    # ── Инициализация состояния ──────────────────────────────────────
+    for key, val in {
+        "roi_cx": W // 2, "roi_cy": H // 2,
+        "roi_rw": W,      "roi_rh": H,
+        "roi_angle": 0,
+    }.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+    # ── Пресеты ──────────────────────────────────────────────────────
+    st.caption("⚡ Быстрый выбор")
+    pc = st.columns(5)
+    _presets = [
+        (0, "🖼️ Весь снимок", W,          H         ),
+        (1, "▪️ 75%",         int(W*.75),  int(H*.75)),
+        (2, "▪️ 50%",         W // 2,      H // 2    ),
+        (3, "▪️ 25%",         W // 4,      H // 4    ),
+        (4, "↺ Сброс угла",  None,        None      ),
+    ]
+    for i, label, pw, ph in _presets:
+        if pc[i].button(label, use_container_width=True, key=f"roi_preset_{i}"):
+            if pw is not None:
+                st.session_state.update(
+                    roi_cx=W // 2, roi_cy=H // 2,
+                    roi_rw=pw,     roi_rh=ph, roi_angle=0,
+                )
+            else:
+                st.session_state["roi_angle"] = 0
+            st.rerun()
+
+    st.divider()
+
+    # ── Положение и размер ───────────────────────────────────────────
+    pos_col, size_col = st.columns(2)
+
+    with pos_col:
+        st.caption("📍 Центр области")
+        cx = st.slider("X центра", 0, W, key="roi_cx")
+        cy = st.slider("Y центра", 0, H, key="roi_cy")
+
+    with size_col:
+        st.caption("📐 Размер")
+        lock_ar = st.checkbox("🔒 Зафиксировать пропорции", key="roi_lock_ar")
+        rw = st.slider("Ширина", 2, W, step=1, key="roi_rw")
+
+        if lock_ar:
+            # Сохраняем AR в момент включения замка
+            if "roi_locked_ar" not in st.session_state:
+                st.session_state["roi_locked_ar"] = (
+                    st.session_state["roi_rh"] / max(2, st.session_state["roi_rw"])
+                )
+            ar = st.session_state["roi_locked_ar"]
+            rh = max(2, min(H, int(rw * ar)))
+            st.session_state["roi_rh"] = rh          # синхронизируем для разблокировки
+            st.info(f"Высота: **{rh} px** · пропорция 1 : {ar:.2f}")
+        else:
+            st.session_state.pop("roi_locked_ar", None)
+            rh = st.slider("Высота", 2, H, step=1, key="roi_rh")
+
+    # ── Угол наклона ─────────────────────────────────────────────────
+    st.divider()
+    angle_col, angle_meta = st.columns([3, 2])
+
+    with angle_col:
+        angle = st.slider(
+            "🔄 Угол наклона (°)", -180, 180, step=1, key="roi_angle",
+            help=(
+                "Поворот ROI вокруг его центра. "
+                "Перед вырезкой снимок разворачивается на обратный угол — "
+                "наклонная область анализируется как прямоугольная."
+            ),
+        )
+    with angle_meta:
+        direction = ("↻ по часовой" if angle > 0
+                     else ("↺ против часовой" if angle < 0 else "горизонтально"))
+        st.metric("Угол", f"{angle}°", delta=direction)
+
+    # ── Финальные значения ───────────────────────────────────────────
+    cx = int(np.clip(cx, 0, W))
+    cy = int(np.clip(cy, 0, H))
+    rw = int(np.clip(rw, 2, W))
+    rh = int(np.clip(rh, 2, H))
+
+    # ── Сводные метрики ──────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Ширина",     f"{rw} px")
+    m2.metric("Высота",     f"{rh} px")
+    m3.metric("Площадь",    f"{rw * rh:,} px²")
+    m4.metric("% снимка",   f"{rw * rh / max(1, W * H) * 100:.1f}%")
+
+    # ── Двойной превью ───────────────────────────────────────────────
+    overview_col, zoom_col = st.columns([3, 2])
+
+    preview = to_rgb_image(image_np.copy())
+    _draw_rotated_rect(preview, cx, cy, rw, rh, angle)
+
+    with overview_col:
+        st.image(
+            preview,
+            caption="Обзор: выделенная область на снимке",
+            use_container_width=True,
+        )
+
+    roi_img, roi_msk = _extract_rotated_roi(
+        image_np, mask_np, cx, cy, rw, rh, angle
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        x0 = st.slider("X начало", 0, W - 2, 0,    key="sx0")
-        x1 = st.slider("X конец",  x0 + 1, W, W,   key="sx1")
-    with col2:
-        y0 = st.slider("Y начало", 0, H - 2, 0,    key="sy0")
-        y1 = st.slider("Y конец",  y0 + 1, H, H,   key="sy1")
+    with zoom_col:
+        if roi_img.size > 0:
+            st.image(
+                to_rgb_image(roi_img),
+                caption=f"Предпросмотр ROI · {rw}×{rh} px · {angle}°",
+                use_container_width=True,
+            )
+        else:
+            st.warning("⚠️ ROI выходит за границы снимка")
 
-    preview = to_rgb_image(image_np)
-    overlay = preview.copy()
-    cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 165, 0), -1)
-    cv2.addWeighted(overlay, 0.20, preview, 0.80, 0, preview)
-    cv2.rectangle(preview, (x0, y0), (x1, y1), (255, 69, 0), 2)
-    st.image(
-        preview,
-        caption=f"Предпросмотр ROI · {x1-x0} × {y1-y0} px",
-        use_container_width=True,
-    )
-
+    # ── Кнопка анализа ───────────────────────────────────────────────
     cache_dir  = run_cache_dir(pair_hash, class_names, config, palette, vis_params)
-    roi_prefix = f"roi_{x0}_{y0}_{x1}_{y1}"
+    roi_prefix = f"roi_{cx}_{cy}_{rw}_{rh}_{angle}"
 
-    _roi_button(
-        image_np[y0:y1, x0:x1],
-        mask_np[y0:y1, x0:x1],
-        class_names, config, palette, vis_params,
-        cache_dir, roi_prefix, "btn_roi_sliders",
-    )
+    if roi_img.size > 0:
+        _roi_button(
+            roi_img, roi_msk,
+            class_names, config, palette, vis_params,
+            cache_dir, roi_prefix, "btn_roi_sliders",
+        )
+    else:
+        st.error("ROI пустой — переместите центр или уменьшите размер")
+        st.button("▶️ Анализ ROI", disabled=True, key="btn_roi_sliders")
 
 
 # ── Публичная точка входа ─────────────────────────────────────────────────────
@@ -307,16 +456,10 @@ def render_tab_roi(
 ) -> None:
     H, W = image_np.shape[:2]
 
-    if CANVAS_AVAILABLE:
-        _canvas_roi(
-            image_np, mask_np, class_names, config, palette, vis_params,
-            H, W, pair_hash,
-        )
-    else:
-        _sliders_roi(
-            image_np, mask_np, class_names, config, palette, vis_params,
-            H, W, pair_hash,
-        )
+    _sliders_roi(
+        image_np, mask_np, class_names, config, palette, vis_params,
+        H, W, pair_hash,
+    )
 
     if "vis_roi" in st.session_state:
         st.divider()
